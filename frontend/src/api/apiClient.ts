@@ -1,7 +1,8 @@
 import axios from 'axios';
 
-// APIクライアントの設定
-const API_BASE_URL = 'http://localhost:8000';
+// 環境に応じたAPIベースURLを設定
+const API_BASE_URL = process.env.REACT_APP_API_BASE_URL || 'http://localhost:8000';
+console.log(`API Base URL: ${API_BASE_URL}`);
 
 // APIクライアントのインスタンス作成
 const apiClient = axios.create({

@@ -12,13 +12,31 @@ import shutil
 import tempfile
 import csv
 from pydantic import BaseModel
+from google.cloud import storage
 
 app = FastAPI(title="ROP Classification API")
+
+# Cloud Storageクライアントの初期化
+storage_client = storage.Client()
+bucket_name = os.environ.get("STORAGE_BUCKET_NAME", "rop-classify-files")
+bucket = None
+
+# 環境変数でCloud Storageの使用を制御
+use_cloud_storage = os.environ.get("USE_CLOUD_STORAGE", "False").lower() == "true"
+
+if use_cloud_storage:
+    try:
+        bucket = storage_client.bucket(bucket_name)
+    except Exception as e:
+        print(f"Cloud Storage initialization error: {e}")
 
 # CORS設定
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # 本番環境では具体的なオリジンを指定する
+    allow_origins=[
+        "https://rop-frontend-xxxxx-an.a.run.app",  # Cloud Run前側のURL（後で実際のURLに変更）
+        "http://localhost:3000"  # 開発環境
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -28,9 +46,28 @@ app.add_middleware(
 os.makedirs("temp", exist_ok=True)
 os.makedirs("output", exist_ok=True)
 
-# 静的ファイルをマウント
+# 静的ファイルをマウント（ローカル開発用）
 app.mount("/temp", StaticFiles(directory="temp"), name="temp")
 app.mount("/output", StaticFiles(directory="output"), name="output")
+
+# Cloud Storage操作のためのヘルパー関数
+def save_file_to_storage(local_file_path, blob_name):
+    """ファイルをCloud Storageに保存"""
+    if not use_cloud_storage:
+        return local_file_path  # ローカル開発では通常のパスを返す
+    
+    blob = bucket.blob(blob_name)
+    blob.upload_from_filename(local_file_path)
+    return f"https://storage.googleapis.com/{bucket_name}/{blob_name}"
+
+def get_file_from_storage(blob_name, local_file_path):
+    """Cloud Storageからファイルを取得"""
+    if not use_cloud_storage:
+        return local_file_path  # ローカル開発では通常のパスを返す
+    
+    blob = bucket.blob(blob_name)
+    blob.download_to_filename(local_file_path)
+    return local_file_path
 
 # タスク状態を管理する辞書
 tasks = {}
