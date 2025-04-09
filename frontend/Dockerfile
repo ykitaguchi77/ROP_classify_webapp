@@ -6,6 +6,10 @@ WORKDIR /app
 COPY package*.json ./
 RUN npm install
 
+# APIベースURLをビルド引数として受け取る
+ARG REACT_APP_API_BASE_URL
+ENV REACT_APP_API_BASE_URL=$REACT_APP_API_BASE_URL
+
 # ソースコードのコピーとビルド
 COPY . .
 RUN npm run build

@@ -115,7 +115,7 @@ const ClassificationInterface: React.FC<ClassificationInterfaceProps> = ({ image
         ) : currentImage ? (
           <Box
             component="img"
-            src={`http://localhost:8000/${currentImage.path}`}
+            src={currentImage.path}
             alt={`Image ${currentIndex + 1}`}
             sx={{
               maxWidth: '100%',

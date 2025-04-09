@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
+from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -13,28 +13,49 @@ import tempfile
 import csv
 from pydantic import BaseModel
 from google.cloud import storage
+import logging
+from urllib.parse import urlparse
+
+# Configure basic logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 app = FastAPI(title="ROP Classification API")
 
 # Cloud Storageクライアントの初期化
-storage_client = storage.Client()
-bucket_name = os.environ.get("STORAGE_BUCKET_NAME", "rop-classify-files")
+storage_client = None
+bucket_name = None
 bucket = None
+use_cloud_storage = False
 
-# 環境変数でCloud Storageの使用を制御
-use_cloud_storage = os.environ.get("USE_CLOUD_STORAGE", "False").lower() == "true"
+try:
+    storage_client = storage.Client()
+    logging.info("Storage client initialized successfully.")
+    bucket_name = os.environ.get("STORAGE_BUCKET_NAME", "rop-classify-files")
+    logging.info(f"STORAGE_BUCKET_NAME from env: {bucket_name}")
+    use_cloud_storage_str = os.environ.get("USE_CLOUD_STORAGE", "False")
+    logging.info(f"USE_CLOUD_STORAGE string from env: {use_cloud_storage_str}")
+    use_cloud_storage = use_cloud_storage_str.lower() == "true"
+    logging.info(f"use_cloud_storage boolean value: {use_cloud_storage}")
+except Exception as e:
+    logging.error(f"Failed to initialize storage client: {e}", exc_info=True)
 
-if use_cloud_storage:
+if use_cloud_storage and storage_client:
+    logging.info(f"Attempting to get bucket: {bucket_name}")
     try:
         bucket = storage_client.bucket(bucket_name)
+        logging.info(f"Bucket '{bucket_name}' retrieved successfully.")
     except Exception as e:
-        print(f"Cloud Storage initialization error: {e}")
+        logging.error(f"Failed to get bucket '{bucket_name}': {e}", exc_info=True)
+elif not storage_client:
+    logging.warning("Storage client is None, cannot get bucket.")
+else:
+    logging.info("use_cloud_storage is False, skipping bucket initialization.")
 
 # CORS設定
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "https://rop-frontend-xxxxx-an.a.run.app",  # Cloud Run前側のURL（後で実際のURLに変更）
+        "https://rop-frontend-qps5z7mgsa-an.a.run.app",  # 実際のフロントエンドURLに修正
         "http://localhost:3000"  # 開発環境
     ],
     allow_credentials=True,
@@ -52,18 +73,29 @@ app.mount("/output", StaticFiles(directory="output"), name="output")
 
 # Cloud Storage操作のためのヘルパー関数
 def save_file_to_storage(local_file_path, blob_name):
-    """ファイルをCloud Storageに保存"""
-    if not use_cloud_storage:
-        return local_file_path  # ローカル開発では通常のパスを返す
-    
-    blob = bucket.blob(blob_name)
-    blob.upload_from_filename(local_file_path)
-    return f"https://storage.googleapis.com/{bucket_name}/{blob_name}"
+    """ファイルをCloud Storageに保存し、公開URLを返す"""
+    logging.info(f"save_file_to_storage called. use_cloud_storage: {use_cloud_storage}, bucket is None: {bucket is None}")
+    # GCSが無効、またはbucketオブジェクトが初期化されていない場合はローカルパスを返す
+    if not use_cloud_storage or not bucket:
+        logging.warning("Cloud Storage is disabled or bucket not initialized. Returning local path: {local_file_path}")
+        # Cloud Run環境ではこのローカルパスは外部からアクセスできない
+        return local_file_path
+
+    try:
+        blob = bucket.blob(blob_name)
+        blob.upload_from_filename(local_file_path)
+        # オブジェクトを公開状態にする (均一アクセス制御のため不要、削除する)
+        # blob.make_public()
+        logging.info(f"Uploaded {local_file_path} to gs://{bucket_name}/{blob_name}. Public access relies on bucket IAM.")
+        return blob.public_url # 公開URLを返す (IAM設定で公開されている前提)
+    except Exception as e:
+        logging.error(f"Failed to upload to GCS: {e}", exc_info=True) # エラーメッセージ修正
+        return f"gs://{bucket_name}/{blob_name}" # エラーが発生したことを示す代替パス
 
 def get_file_from_storage(blob_name, local_file_path):
     """Cloud Storageからファイルを取得"""
     if not use_cloud_storage:
-        return local_file_path  # ローカル開発では通常のパスを返す
+        return local_file_path # ローカル開発では常にローカルパスを返す
     
     blob = bucket.blob(blob_name)
     blob.download_to_filename(local_file_path)
@@ -86,44 +118,69 @@ class ClassificationData(BaseModel):
 class ClassificationList(BaseModel):
     classifications: List[ClassificationData]
 
+class ImageDownloadInfo(BaseModel):
+    path: str # これは GCS URL になる
+    display_name: str
+    video_name: Optional[str] = None # オプション
+
+class ImageDownloadList(BaseModel):
+    images: List[ImageDownloadInfo]
+
 @app.get("/")
 def read_root():
     return {"message": "ROP Classification API"}
 
 @app.post("/upload-images")
 async def upload_images(files: List[UploadFile] = File(...)):
-    """複数の画像ファイルをアップロード"""
+    """複数の画像ファイルをアップロードし、GCSの公開URLを返す"""
     results = []
-    
+    temp_dir = "temp"
+    os.makedirs(temp_dir, exist_ok=True)
+
     for file in files:
-        # ファイル拡張子を検証
         filename = file.filename
         name, ext = os.path.splitext(filename)
         ext = ext.lower()
-        
+
         if ext not in ['.jpg', '.jpeg', '.png', '.bmp']:
+            logging.warning(f"Skipping unsupported file format: {filename}")
             continue
-            
-        # 一意のIDを生成しつつ、オリジナルファイル名を保持
+
         file_id = str(uuid.uuid4())
-        # ファイル名から不適切な文字を除去
         safe_name = ''.join(c for c in name if c.isalnum() or c in ['-', '_'])
-        
-        # 保存ファイル名を作成（オリジナル名を保持しながら一意性を確保）
-        save_filename = f"{safe_name}-{file_id[:8]}{ext}"
-        file_path = f"temp/{save_filename}"
-        
-        # 画像を保存
-        with open(file_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-            
-        results.append({
-            "id": file_id,
-            "original_name": filename,
-            "display_name": filename,  # 表示用の名前を追加
-            "path": file_path
-        })
-    
+        local_filename = f"{safe_name}-{file_id[:8]}{ext}"
+        local_file_path = os.path.join(temp_dir, local_filename)
+        # GCS上のパス（例: images/ファイル名）
+        blob_name = f"images/{local_filename}"
+
+        try:
+            # ローカル一時ファイルに保存
+            with open(local_file_path, "wb") as buffer:
+                shutil.copyfileobj(file.file, buffer)
+            logging.info(f"Saved uploaded file temporarily to {local_file_path}")
+
+            # GCS にアップロードして公開 URL を取得
+            public_url = save_file_to_storage(local_file_path, blob_name)
+
+            results.append({
+                "id": file_id,
+                "original_name": filename,
+                "display_name": filename,
+                "path": public_url # GCSの公開URLを返す
+            })
+        except Exception as e:
+            logging.error(f"Error processing file {filename}: {e}", exc_info=True)
+        finally:
+            # ローカル一時ファイルを削除
+            if os.path.exists(local_file_path):
+                try:
+                    os.remove(local_file_path)
+                    logging.info(f"Removed temporary file {local_file_path}")
+                except OSError as e:
+                    logging.error(f"Error removing temporary file {local_file_path}: {e}")
+
+    # 一時ディレクトリ自体は残しておく（他のリクエストで使用する可能性があるため）
+    # 必要であれば、古いファイルを定期的に削除する仕組みを検討
     return JSONResponse(content={"images": results})
 
 @app.post("/extract-frames")
@@ -173,92 +230,103 @@ async def extract_frames(background_tasks: BackgroundTasks, file: UploadFile = F
         raise HTTPException(status_code=500, detail=str(e))
 
 def process_video(video_path: str, task_id: str, video_name: str):
-    """動画からフレームを抽出するバックグラウンド処理"""
+    """動画からフレームを抽出するバックグラウンド処理 (GCS対応)"""
+    output_dir = None # finally で使うためにスコープを外に出す
+    cap = None      # finally で使うためにスコープを外に出す
     try:
         # タスク状態を更新
         tasks[task_id].status = "processing"
         tasks[task_id].progress = 0.0
-        
-        # 出力ディレクトリを作成
-        output_dir = f"output/{task_id}"
+        logging.info(f"Starting video processing for task {task_id}, video: {video_name}")
+
+        # フレームの一時保存ディレクトリを作成
+        output_dir = os.path.join("output", task_id) # パス結合をos.path.joinに変更
         os.makedirs(output_dir, exist_ok=True)
-        
+
         # 動画を開く
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
             raise Exception("Failed to open video file")
-        
-        # 総フレーム数を取得
+
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         if total_frames <= 0:
             raise Exception("Invalid video file or no frames detected")
-        
-        # フレームレート取得
+
         fps = cap.get(cv2.CAP_PROP_FPS)
-        # すべてのフレームを抽出する
-        frame_interval = 1
-        
-        # フレーム抽出
-        frames_extracted = 0
+        frame_interval = 1 # すべてのフレームを抽出
+        frames_extracted_count = 0
         frame_count = 0
-        extracted_frames = []
-        
+        extracted_frames_metadata = []
+
         while True:
             ret, frame = cap.read()
             if not ret:
                 break
-                
-            # 指定間隔でフレームを保存
+
             if frame_count % frame_interval == 0:
                 frame_id = str(uuid.uuid4())
-                
-                # フレーム番号をゼロ埋め
-                frame_num_padded = f"{frames_extracted:04d}"
-                
-                # ファイル名を作成: 動画名-0001.jpg のような形式
+                frame_num_padded = f"{frames_extracted_count:04d}"
                 frame_filename = f"{video_name}-{frame_num_padded}.jpg"
-                frame_path = f"{output_dir}/{frame_filename}"
-                
-                cv2.imwrite(frame_path, frame)
-                
-                extracted_frames.append({
+                frame_local_path = os.path.join(output_dir, frame_filename)
+                frame_blob_name = f"frames/{task_id}/{frame_filename}"
+
+                # ローカルに一時保存
+                if not cv2.imwrite(frame_local_path, frame):
+                    logging.warning(f"Failed to write frame {frame_local_path}")
+                    # フレーム書き込み失敗時はスキップ？ エラー処理検討
+                    frame_count += 1
+                    continue
+
+                # GCS にアップロードして公開 URL を取得
+                frame_public_url = save_file_to_storage(frame_local_path, frame_blob_name)
+
+                extracted_frames_metadata.append({
                     "id": frame_id,
-                    "path": frame_path,
+                    "path": frame_public_url, # GCS公開URL
                     "frame_number": frame_count,
-                    "display_name": frame_filename,  # 表示用ファイル名を追加
-                    "video_name": video_name  # 元の動画名を追加
+                    "display_name": frame_filename,
+                    "video_name": video_name
                 })
-                
-                frames_extracted += 1
-            
-            # 進捗状況を更新
+
+                # ローカル一時フレームを削除
+                if os.path.exists(frame_local_path):
+                    try:
+                        os.remove(frame_local_path)
+                    except OSError as e:
+                         logging.error(f"Error removing temporary frame {frame_local_path}: {e}")
+
+                frames_extracted_count += 1
+
             frame_count += 1
             progress = min(0.99, frame_count / total_frames)
             tasks[task_id].progress = progress
-        
-        # 後処理
-        cap.release()
-        
-        # 一時ファイルを削除
-        if os.path.exists(video_path):
-            os.unlink(video_path)
-        
+
         # タスク完了
         tasks[task_id].status = "completed"
         tasks[task_id].progress = 1.0
-        tasks[task_id].result = {
-            "frames": extracted_frames,
-            "total_frames": frames_extracted
-        }
-        
+        tasks[task_id].result = {"frames": extracted_frames_metadata}
+        logging.info(f"Video processing completed for task {task_id}. Extracted {frames_extracted_count} frames.")
+
     except Exception as e:
-        # エラー処理
+        logging.error(f"Error processing video for task {task_id}: {e}", exc_info=True)
         tasks[task_id].status = "failed"
         tasks[task_id].error = str(e)
-        
-        # 一時ファイルと出力ディレクトリを削除
+    finally:
+        # リソース解放と一時ファイル/ディレクトリ削除
+        if cap is not None and cap.isOpened():
+            cap.release()
         if os.path.exists(video_path):
-            os.unlink(video_path)
+            try:
+                os.unlink(video_path)
+                logging.info(f"Removed temporary video file {video_path}")
+            except OSError as e:
+                logging.error(f"Error removing temporary video file {video_path}: {e}")
+        if output_dir is not None and os.path.exists(output_dir):
+            try:
+                shutil.rmtree(output_dir)
+                logging.info(f"Removed temporary frame directory {output_dir}")
+            except OSError as e:
+                logging.error(f"Error removing temporary frame directory {output_dir}: {e}")
 
 @app.get("/task-status/{task_id}")
 async def get_task_status(task_id: str):
@@ -269,65 +337,107 @@ async def get_task_status(task_id: str):
     return tasks[task_id]
 
 @app.post("/download-images")
-async def download_images(image_paths: List[dict]):
-    """指定された画像をZIPファイルとして圧縮してダウンロード"""
-    # 一時的なメモリバッファを作成してZIPファイルを生成
+async def download_images_as_zip(data: ImageDownloadList):
+    """指定されたGCS URLの画像をダウンロードし、Zipファイルとして返す"""
+    images_to_download = data.images
+    logging.info(f"Received request to download {len(images_to_download)} images.")
+
+    if not images_to_download:
+        raise HTTPException(status_code=400, detail="No image data provided")
+
+    if not use_cloud_storage or not bucket:
+         logging.error("Cloud Storage is not configured properly for downloading.")
+         raise HTTPException(status_code=500, detail="Server storage misconfiguration")
+
     zip_buffer = io.BytesIO()
-    
-    # 画像を動画名でグループ化する
-    video_groups = {}
-    
-    with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
-        for item in image_paths:
-            image_path = item.get("path", "")
-            display_name = item.get("display_name", "")
-            video_name = item.get("video_name", "")
-            
-            # パスが存在し、ファイルが存在する場合のみ追加
-            if image_path and os.path.exists(image_path):
-                # 表示名がある場合はそれを使用、なければパスからファイル名を抽出
-                file_name = display_name or os.path.basename(image_path)
-                
-                # 動画名が指定されている場合は、そのフォルダ内に配置
-                if video_name:
-                    archive_path = f"{video_name}/{file_name}"
-                else:
-                    archive_path = file_name
-                
-                # ZIPファイルにファイルを追加
-                zip_file.write(image_path, archive_path)
-    
-    # バッファの先頭に戻す
+    failed_downloads = []
+
+    with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zipf:
+        for image_info in images_to_download:
+            try:
+                # GCS URLからバケット名とオブジェクト名を抽出
+                parsed_url = urlparse(image_info.path)
+                if not parsed_url.netloc.endswith('storage.googleapis.com'):
+                    logging.warning(f"Skipping invalid GCS URL: {image_info.path}")
+                    failed_downloads.append(image_info.display_name + " (Invalid URL)")
+                    continue
+
+                # パス部分から先頭のスラッシュを除去してオブジェクト名を取得
+                # 例: /rop-classify-files/images/file.jpg -> images/file.jpg
+                object_name = parsed_url.path.strip('/')
+                # バケット名がパスに含まれている場合、それも除去する
+                if object_name.startswith(bucket_name + '/'):
+                    object_name = object_name[len(bucket_name) + 1:]
+
+                logging.info(f"Attempting to download blob: {object_name} from bucket {bucket_name}")
+                blob = bucket.blob(object_name)
+
+                if not blob.exists():
+                     logging.warning(f"Blob not found: {object_name}")
+                     failed_downloads.append(image_info.display_name + " (Not Found in GCS)")
+                     continue
+
+                # GCSからファイルをメモリにダウンロード
+                image_bytes = blob.download_as_bytes()
+
+                # Zipファイルに追加 (フォルダ構造を作る場合はここでパスを組み立てる)
+                zip_path = image_info.display_name
+                if image_info.video_name:
+                    # video_name をフォルダ名として使用（サニタイズ推奨）
+                    safe_video_name = ''.join(c for c in image_info.video_name if c.isalnum() or c in ['-', '_'])
+                    zip_path = os.path.join(safe_video_name, image_info.display_name)
+
+                zipf.writestr(zip_path, image_bytes)
+                logging.info(f"Added {image_info.display_name} to zip.")
+
+            except Exception as e:
+                logging.error(f"Failed to download or add image {image_info.display_name} (URL: {image_info.path}) to zip: {e}", exc_info=True)
+                failed_downloads.append(image_info.display_name + f" (Error: {e})")
+
+    if failed_downloads:
+        logging.warning(f"Some images failed to download: {failed_downloads}")
+        # ここで部分的な成功として Zip を返すか、エラーにするか選択できる
+        # 今回は成功したものだけでも返す
+
     zip_buffer.seek(0)
-    
-    # ファイルをストリーミングレスポンスとして返す
+
     return StreamingResponse(
         zip_buffer,
         media_type="application/zip",
-        headers={
-            "Content-Disposition": f"attachment; filename=classified_images.zip"
-        }
+        headers={ "Content-Disposition": f"attachment; filename=downloaded_images.zip" }
     )
 
 @app.post("/save-classifications")
 async def save_classifications(data: ClassificationList):
-    """分類結果を保存"""
+    """分類データを受け取り、CSVファイルとしてレスポンスを返す"""
+    classifications = data.classifications
+    logging.info(f"Received {len(classifications)} classifications to generate CSV.")
+
+    if not classifications:
+        raise HTTPException(status_code=400, detail="No classifications data provided")
+
     try:
-        # 一意のファイル名を生成
-        file_id = str(uuid.uuid4())
-        file_path = f"output/classification_{file_id}.csv"
-        
-        # CSVに保存
-        with open(file_path, mode='w', newline='') as file:
-            writer = csv.writer(file)
-            writer.writerow(['image_id', 'classification'])
-            for item in data.classifications:
-                writer.writerow([item.image_id, item.classification])
-        
-        return {"file_id": file_id, "path": file_path}
-    
+        # CSVデータをメモリ上で生成
+        output = io.StringIO()
+        writer = csv.writer(output)
+        # ヘッダー書き込み
+        writer.writerow(['image_id', 'classification'])
+        # データ書き込み
+        for item in classifications:
+            writer.writerow([item.image_id, item.classification])
+
+        # StringIOのカーソルを先頭に戻す
+        output.seek(0)
+
+        # StreamingResponseでCSVデータを返す
+        return StreamingResponse(
+            output,
+            media_type="text/csv",
+            headers={ "Content-Disposition": "attachment; filename=classifications.csv" }
+        )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logging.error(f"Error generating CSV: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to generate CSV file")
 
 @app.post("/load-csv")
 async def load_csv(file: UploadFile = File(...)):

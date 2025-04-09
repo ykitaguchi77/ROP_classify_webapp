@@ -1,7 +1,7 @@
-import axios from 'axios';
+import axios, { AxiosProgressEvent } from 'axios';
 
 // 環境に応じたAPIベースURLを設定
-const API_BASE_URL = process.env.REACT_APP_API_BASE_URL || 'http://localhost:8000';
+export const API_BASE_URL = process.env.REACT_APP_API_BASE_URL || 'http://localhost:8000';
 console.log(`API Base URL: ${API_BASE_URL}`);
 
 // APIクライアントのインスタンス作成
@@ -20,8 +20,11 @@ const uploadClient = axios.create({
   },
 });
 
+// 進捗更新コールバックの型定義
+type ProgressCallback = (progress: number | null) => void;
+
 // 画像をアップロードする関数
-export const uploadImages = async (files: File[]) => {
+export const uploadImages = async (files: File[], onProgress: ProgressCallback) => {
   const formData = new FormData();
   files.forEach(file => {
     formData.append('files', file);
@@ -32,24 +35,43 @@ export const uploadImages = async (files: File[]) => {
       headers: {
         'Content-Type': 'multipart/form-data',
       },
+      onUploadProgress: (progressEvent: AxiosProgressEvent) => {
+        if (progressEvent.total) {
+          const percentCompleted = Math.round((progressEvent.loaded * 100) / progressEvent.total);
+          onProgress(percentCompleted);
+        }
+      },
     });
+    onProgress(null); // 完了したらnullを通知
     return response.data;
   } catch (error) {
     console.error('Error uploading images:', error);
+    onProgress(null); // エラー時もnullを通知
     throw error;
   }
 };
 
 // 動画からフレームを抽出する関数
-export const extractFrames = async (file: File) => {
+export const extractFrames = async (file: File, onProgress: ProgressCallback) => {
   const formData = new FormData();
   formData.append('file', file);
 
   try {
-    const response = await uploadClient.post('/extract-frames', formData);
+    const response = await uploadClient.post('/extract-frames', formData, {
+      onUploadProgress: (progressEvent: AxiosProgressEvent) => {
+        if (progressEvent.total) {
+          const percentCompleted = Math.round((progressEvent.loaded * 100) / progressEvent.total);
+          onProgress(percentCompleted);
+        }
+      },
+    });
+    // フレーム抽出自体はバックグラウンドタスクなので、ここではアップロード完了 = 進捗完了と見なさない
+    // タスク開始後に別途ポーリングで進捗を見るため、ここでは完了通知はしない
+    // onProgress(null);
     return response.data;
   } catch (error) {
     console.error('Error extracting frames:', error);
+    onProgress(null); // エラー時はnullを通知
     throw error;
   }
 };
@@ -73,12 +95,14 @@ export interface ClassificationData {
 
 export const saveClassifications = async (classifications: ClassificationData[]) => {
   try {
-    const response = await apiClient.post('/save-classifications', {
-      classifications,
-    });
-    return response.data;
+    // CSVデータを直接Blobとして受け取る
+    const response = await apiClient.post('/save-classifications', 
+      { classifications },
+      { responseType: 'blob' } // レスポンスタイプをblobに指定
+    );
+    return response.data; // Blobデータが返る
   } catch (error) {
-    console.error('Error saving classifications:', error);
+    console.error('Error saving classifications / downloading CSV:', error);
     throw error;
   }
 };
@@ -101,7 +125,7 @@ export const loadCSV = async (file: File) => {
 export const downloadImages = async (images: any[]) => {
   try {
     // Blobとして受け取るための設定
-    const response = await apiClient.post('/download-images', images, {
+    const response = await apiClient.post('/download-images', { images: images }, {
       responseType: 'blob'
     });
     
@@ -109,7 +133,7 @@ export const downloadImages = async (images: any[]) => {
     const url = window.URL.createObjectURL(new Blob([response.data]));
     const link = document.createElement('a');
     link.href = url;
-    link.setAttribute('download', 'classified_images.zip');
+    link.setAttribute('download', 'downloaded_images.zip');
     
     // ダウンロードをトリガー
     document.body.appendChild(link);

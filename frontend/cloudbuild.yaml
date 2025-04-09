@@ -1,0 +1,13 @@
+steps:
+- name: 'gcr.io/cloud-builders/docker'
+  args: [
+    'build',
+    '--no-cache',
+    '-t', 'gcr.io/rop-classifier/rop-frontend:latest',
+    '--build-arg', 'REACT_APP_API_BASE_URL=${_REACT_APP_API_BASE_URL}', # Pass substitution as build-arg
+    '.'
+  ]
+images:
+- 'gcr.io/rop-classifier/rop-frontend:latest'
+substitutions:
+  _REACT_APP_API_BASE_URL: 'https://rop-backend-qps5z7mgsa-an.a.run.app' # Default value, can be overridden 

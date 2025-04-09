@@ -5,11 +5,12 @@ import { uploadImages, extractFrames } from '../api/apiClient';
 interface FileUploaderProps {
   onImagesUploaded: (images: any[]) => void;
   onFramesExtracted: (taskId: string) => void;
+  onUploadProgressUpdate: (progress: number | null) => void;
   onReset?: () => void;  // リセット機能を追加
   hasImages?: boolean;   // 画像があるかどうかのフラグ
 }
 
-const FileUploader: React.FC<FileUploaderProps> = ({ onImagesUploaded, onFramesExtracted, onReset, hasImages = false }) => {
+const FileUploader: React.FC<FileUploaderProps> = ({ onImagesUploaded, onFramesExtracted, onUploadProgressUpdate, onReset, hasImages = false }) => {
   const [dragging, setDragging] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -42,6 +43,7 @@ const FileUploader: React.FC<FileUploaderProps> = ({ onImagesUploaded, onFramesE
   const handleFiles = async (files: File[]) => {
     setLoading(true);
     setError(null);
+    onUploadProgressUpdate(0);
     
     try {
       // ファイルタイプで分類
@@ -50,18 +52,20 @@ const FileUploader: React.FC<FileUploaderProps> = ({ onImagesUploaded, onFramesE
       
       if (imageFiles.length > 0) {
         // 画像ファイルをアップロード
-        const result = await uploadImages(imageFiles);
+        const result = await uploadImages(imageFiles, onUploadProgressUpdate);
         onImagesUploaded(result.images);
       }
       
       if (videoFiles.length > 0 && videoFiles.length === 1) {
         // 動画ファイルからフレームを抽出（現時点では1つの動画のみ対応）
         const videoFile = videoFiles[0];
-        const result = await extractFrames(videoFile);
+        const result = await extractFrames(videoFile, onUploadProgressUpdate);
         onFramesExtracted(result.task_id);
+        onUploadProgressUpdate(null);
       }
     } catch (err: any) {
       setError(err.message || 'ファイルのアップロードに失敗しました');
+      onUploadProgressUpdate(null);
     } finally {
       setLoading(false);
       // ファイル入力をリセット

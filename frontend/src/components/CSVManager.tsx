@@ -32,23 +32,29 @@ const CSVManager: React.FC<CSVManagerProps> = ({ images, onCsvLoaded }) => {
       
       // APIリクエスト用のデータに変換
       const classifications: ClassificationData[] = classifiedImages.map(img => ({
-        // 表示名または元のファイル名をIDとして使用
         image_id: img.display_name || img.original_name || img.id,
         classification: img.classification as 'yes' | 'no',
       }));
       
-      // APIを呼び出してCSVを保存
-      const result = await saveClassifications(classifications);
-      setSuccess('分類結果が正常に保存されました');
+      // APIを呼び出してCSVデータをBlobとして取得
+      const blob = await saveClassifications(classifications);
       
-      // CSVファイルをダウンロード（サーバーから直接提供する場合）
+      // Blobからダウンロードリンクを作成してクリック
+      const url = window.URL.createObjectURL(blob);
       const link = document.createElement('a');
-      link.href = `http://localhost:8000/${result.path}`;
-      link.download = 'classifications.csv';
+      link.href = url;
+      link.setAttribute('download', 'classifications.csv');
+      document.body.appendChild(link);
       link.click();
       
+      // 後片付け
+      link.parentNode?.removeChild(link);
+      window.URL.revokeObjectURL(url);
+      
+      setSuccess('CSVファイルがダウンロードされました');
+      
     } catch (err: any) {
-      setError(err.message || 'CSVのエクスポートに失敗しました');
+      setError(err.message || 'CSVのエクスポート/ダウンロードに失敗しました');
     } finally {
       setLoading(false);
     }

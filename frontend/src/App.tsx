@@ -1,5 +1,5 @@
-import React, { useState, useEffect } from 'react';
-import { Container, Typography, CssBaseline, Box, AppBar, Toolbar, Button } from '@mui/material';
+import React, { useState, useEffect, ChangeEvent } from 'react';
+import { Container, Typography, CssBaseline, Box, AppBar, Toolbar, Button, LinearProgress } from '@mui/material';
 import FileUploader from './components/FileUploader';
 import ClassificationInterface from './components/ClassificationInterface';
 import TaskProgress from './components/TaskProgress';
@@ -7,11 +7,13 @@ import CSVManager from './components/CSVManager';
 import { getTaskStatus } from './api/apiClient';
 import { ImageData, TaskStatus, ClassificationData } from './types';
 import './App.css';
+import axios from 'axios';
 
 function App() {
   const [images, setImages] = useState<ImageData[]>([]);
   const [currentTaskId, setCurrentTaskId] = useState<string | null>(null);
   const [taskStatus, setTaskStatus] = useState<TaskStatus | null>(null);
+  const [uploadProgress, setUploadProgress] = useState<number | null>(null);
 
   // 画像をアップロードした時のハンドラー
   const handleImagesUploaded = (uploadedImages: ImageData[]) => {
@@ -63,6 +65,11 @@ function App() {
     }
   };
 
+  // ファイルアップロードの進捗を更新するハンドラー
+  const handleUploadProgressUpdate = (progress: number | null) => {
+    setUploadProgress(progress);
+  };
+
   // タスクステータスを定期的にポーリング
   useEffect(() => {
     if (!currentTaskId) return;
@@ -110,6 +117,7 @@ function App() {
           <FileUploader 
             onImagesUploaded={handleImagesUploaded} 
             onFramesExtracted={handleFramesExtracted}
+            onUploadProgressUpdate={handleUploadProgressUpdate}
             onReset={handleResetImages}
             hasImages={images.length > 0}
           />
@@ -127,6 +135,13 @@ function App() {
             images={images} 
             onClassify={handleClassify} 
           />
+          
+          {uploadProgress !== null && (
+            <Box sx={{ width: '100%', mt: 2 }}>
+              <LinearProgress variant="determinate" value={uploadProgress} />
+              <Typography variant="body2" color="text.secondary">{`${uploadProgress}%`}</Typography>
+            </Box>
+          )}
         </Box>
       </Container>
     </>
