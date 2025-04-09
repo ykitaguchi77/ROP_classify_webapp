@@ -34,10 +34,10 @@
 
 ## アプリケーションへのアクセス
 
-デプロイ済みのアプリケーションは以下のURLでアクセスできます：
+デプロイ済みのアプリケーションは、各環境に割り当てられた Cloud Run の URL でアクセスできます。
 
-- **フロントエンド:** [https://rop-frontend-qps5z7mgsa-an.a.run.app](https://rop-frontend-qps5z7mgsa-an.a.run.app)
-- **バックエンドAPI:** [https://rop-backend-qps5z7mgsa-an.a.run.app](https://rop-backend-qps5z7mgsa-an.a.run.app) (通常、フロントエンド経由で利用)
+- **フロントエンド:** (デプロイ先の Cloud Run URL)
+- **バックエンドAPI:** (デプロイ先の Cloud Run URL - 通常、フロントエンド経由で利用)
 
 ---
 
@@ -120,7 +120,7 @@ lsof -i :3000 | grep LISTEN | awk '{print $2}' | xargs kill -9
 
 ## 使い方 (Web アプリケーション)
 
-1. フロントエンドURL ([https://rop-frontend-qps5z7mgsa-an.a.run.app](https://rop-frontend-qps5z7mgsa-an.a.run.app)) にアクセスします。
+1. フロントエンドURL (デプロイ先の Cloud Run URL) にアクセスします。
 2. 「ファイルをアップロード」セクションで「画像をアップロード」または「動画をアップロード」ボタンをクリックしてファイルを選択します。
 3. 画像分類インターフェースで、表示されている画像を「Yes」または「No」に分類します。
 4. 画像ナビゲーションのスライダー、左右のボタン、またはキーボードショートカット（左右矢印キー、Y/Nキー）で操作します。
