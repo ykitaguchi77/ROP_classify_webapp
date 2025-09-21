@@ -3,11 +3,11 @@ steps:
   args: [
     'build',
     '--no-cache',
-    '-t', 'gcr.io/rop-classifier/rop-frontend:latest',
-    '--build-arg', 'REACT_APP_API_BASE_URL=${_REACT_APP_API_BASE_URL}', # Pass substitution as build-arg
+    '-t', 'asia-northeast1-docker.pkg.dev/$PROJECT_ID/app/rop-frontend:latest',
+    '--build-arg', 'REACT_APP_API_BASE_URL=${_REACT_APP_API_BASE_URL}',
     '.'
   ]
 images:
-- 'gcr.io/rop-classifier/rop-frontend:latest'
+- 'asia-northeast1-docker.pkg.dev/$PROJECT_ID/app/rop-frontend:latest'
 substitutions:
-  _REACT_APP_API_BASE_URL: 'https://rop-backend-qps5z7mgsa-an.a.run.app' # Default value, can be overridden 
+  _REACT_APP_API_BASE_URL: ''  # デフォルト空（ビルド時に渡す）

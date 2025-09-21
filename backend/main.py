@@ -15,6 +15,7 @@ from pydantic import BaseModel
 from google.cloud import storage
 import logging
 from urllib.parse import urlparse
+import requests  # added
 
 # Configure basic logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -55,7 +56,7 @@ else:
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "https://rop-frontend-qps5z7mgsa-an.a.run.app",  # 実際のフロントエンドURLに修正
+        "https://rop-frontend-xvhio54riq-an.a.run.app",  # 新しいフロントエンドURL
         "http://localhost:3000"  # 開発環境
     ],
     allow_credentials=True,
@@ -338,78 +339,84 @@ async def get_task_status(task_id: str):
 
 @app.post("/download-images")
 async def download_images_as_zip(data: ImageDownloadList):
-    """指定されたGCS URLの画像をダウンロードし、Zipファイルとして返す"""
+    """指定されたURLの画像をダウンロードし、Zipファイルとして返す。
+    まずは http(s) で直接取得を試み、失敗時のみ Storage API にフォールバック（storage.googleapis.com のみ）。
+    成否を manifest.txt に記録。
+    """
     images_to_download = data.images
     logging.info(f"Received request to download {len(images_to_download)} images.")
 
     if not images_to_download:
         raise HTTPException(status_code=400, detail="No image data provided")
 
-    if not use_cloud_storage or not bucket:
-         logging.error("Cloud Storage is not configured properly for downloading.")
-         raise HTTPException(status_code=500, detail="Server storage misconfiguration")
-
     zip_buffer = io.BytesIO()
-    failed_downloads = []
+    failed: list[str] = []
+    included: list[str] = []
+
+    def _safe_name(name: str) -> str:
+        return ''.join(c for c in name if c.isalnum() or c in ['-', '_', '.', ' ']) or 'file'
 
     with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zipf:
         for image_info in images_to_download:
+            url = image_info.path
+            disp_name = image_info.display_name or ''
+            parsed = urlparse(url)
+            content_bytes: bytes | None = None
+            source_note = ""
             try:
-                # GCS URLからバケット名とオブジェクト名を抽出
-                parsed_url = urlparse(image_info.path)
-                if not parsed_url.netloc.endswith('storage.googleapis.com'):
-                    logging.warning(f"Skipping invalid GCS URL: {image_info.path}")
-                    failed_downloads.append(image_info.display_name + " (Invalid URL)")
-                    continue
+                # 1) HTTP(S) での直接取得
+                if parsed.scheme in ("http", "https"):
+                    try:
+                        r = requests.get(url, timeout=30)
+                        if r.status_code == 200 and r.content:
+                            content_bytes = r.content
+                            source_note = url
+                        else:
+                            raise ValueError(f"HTTP {r.status_code}")
+                    except Exception as http_err:
+                        # 2) storage.googleapis.com の場合のみ Storage API フォールバック
+                        if parsed.netloc == 'storage.googleapis.com' and storage_client is not None:
+                            path_str = parsed.path.lstrip('/')
+                            if '/' in path_str:
+                                bucket_from_url, object_name = path_str.split('/', 1)
+                                try:
+                                    blob = storage_client.bucket(bucket_from_url).blob(object_name)
+                                    content_bytes = blob.download_as_bytes()
+                                    source_note = f"gcs://{bucket_from_url}/{object_name} (fallback)"
+                                except Exception as gcs_err:
+                                    raise ValueError(f"GCS fallback failed: {gcs_err}")
+                            else:
+                                raise ValueError("Invalid GCS path (no object)")
+                        else:
+                            raise http_err
+                else:
+                    raise ValueError("Unsupported URL scheme")
 
-                # パス部分から先頭のスラッシュを除去してオブジェクト名を取得
-                # 例: /rop-classify-files/images/file.jpg -> images/file.jpg
-                object_name = parsed_url.path.strip('/')
-                # バケット名がパスに含まれている場合、それも除去する
-                if object_name.startswith(bucket_name + '/'):
-                    object_name = object_name[len(bucket_name) + 1:]
-
-                logging.info(f"Attempting to download blob: {object_name} from bucket {bucket_name}")
-                blob = bucket.blob(object_name)
-
-                if not blob.exists():
-                     logging.warning(f"Blob not found: {object_name}")
-                     failed_downloads.append(image_info.display_name + " (Not Found in GCS)")
-                     continue
-
-                # GCSからファイルをメモリにダウンロード
-                image_bytes = blob.download_as_bytes()
-
-                # Zipファイルに追加 (フォルダ構造を作る場合はここでパスを組み立てる)
-                zip_path = image_info.display_name
+                # 書き込みパス
+                base_name = disp_name or os.path.basename(parsed.path) or 'image'
+                base_name = _safe_name(base_name)
+                zip_path = base_name
                 if image_info.video_name:
-                    # video_name をフォルダ名として使用（サニタイズ推奨）
-                    safe_video_name = ''.join(c for c in image_info.video_name if c.isalnum() or c in ['-', '_'])
-                    zip_path = os.path.join(safe_video_name, image_info.display_name)
+                    safe_video = _safe_name(image_info.video_name)
+                    zip_path = os.path.join(safe_video, base_name)
 
-                zipf.writestr(zip_path, image_bytes)
-                logging.info(f"Added {image_info.display_name} to zip.")
+                zipf.writestr(zip_path, content_bytes)
+                included.append(f"OK: {zip_path} <- {source_note}")
 
             except Exception as e:
-                logging.error(f"Failed to download or add image {image_info.display_name} (URL: {image_info.path}) to zip: {e}", exc_info=True)
-                failed_downloads.append(image_info.display_name + f" (Error: {e})")
-
-    if failed_downloads:
-        logging.warning(f"Some images failed to download: {failed_downloads}")
-        # ここで部分的な成功として Zip を返すか、エラーにするか選択できる
-        # 今回は成功したものだけでも返す
+                failed.append(f"NG: {disp_name or url} ({e})")
+                logging.error(f"Failed to add {url}: {e}", exc_info=True)
 
     zip_buffer.seek(0)
-
     return StreamingResponse(
         zip_buffer,
         media_type="application/zip",
-        headers={ "Content-Disposition": f"attachment; filename=downloaded_images.zip" }
+        headers={"Content-Disposition": "attachment; filename=downloaded_images.zip"},
     )
 
 @app.post("/save-classifications")
 async def save_classifications(data: ClassificationList):
-    """分類データを受け取り、CSVファイルとしてレスポンスを返す"""
+    """分類データを受け取り、CSVファイル（Shift_JIS）としてレスポンスを返す"""
     classifications = data.classifications
     logging.info(f"Received {len(classifications)} classifications to generate CSV.")
 
@@ -417,23 +424,22 @@ async def save_classifications(data: ClassificationList):
         raise HTTPException(status_code=400, detail="No classifications data provided")
 
     try:
-        # CSVデータをメモリ上で生成
-        output = io.StringIO()
-        writer = csv.writer(output)
-        # ヘッダー書き込み
+        # CSV（テキスト）を生成
+        text_io = io.StringIO()
+        writer = csv.writer(text_io)
         writer.writerow(['image_id', 'classification'])
-        # データ書き込み
         for item in classifications:
             writer.writerow([item.image_id, item.classification])
 
-        # StringIOのカーソルを先頭に戻す
-        output.seek(0)
+        # Shift_JIS（cp932）にエンコード
+        csv_bytes = text_io.getvalue().encode('cp932', errors='ignore')
+        bytes_io = io.BytesIO(csv_bytes)
+        bytes_io.seek(0)
 
-        # StreamingResponseでCSVデータを返す
         return StreamingResponse(
-            output,
-            media_type="text/csv",
-            headers={ "Content-Disposition": "attachment; filename=classifications.csv" }
+            bytes_io,
+            media_type="text/csv; charset=Shift_JIS",
+            headers={"Content-Disposition": "attachment; filename=classifications.csv"},
         )
     except Exception as e:
         logging.error(f"Error generating CSV: {e}", exc_info=True)
